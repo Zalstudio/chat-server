@@ -1,70 +1,111 @@
-from flask import Flask, request, jsonify
-import json, hashlib, secrets, datetime
+import socket
+import threading
+import json
+import hashlib
+import secrets
+import datetime
 from pathlib import Path
+import os  # добавлено для работы с переменными окружения
 
-app = Flask(__name__)
+HOST = '0.0.0.0'  # слушать все интерфейсы
+
+# Получаем порт из переменной окружения PORT, если нет — ставим 10000
+PORT = int(os.environ.get("PORT", 10000))
+
 DATA_DIR = Path("data")
 ACCOUNTS_FILE = DATA_DIR / "accounts.json"
 CHAT_FILE = DATA_DIR / "chat.json"
 
-def init_storage():
+clients = []
+lock = threading.Lock()
+
+def ensure_data_files():
     DATA_DIR.mkdir(exist_ok=True)
     if not ACCOUNTS_FILE.exists():
-        ACCOUNTS_FILE.write_text(json.dumps({"users": []}, indent=2))
+        ACCOUNTS_FILE.write_text(json.dumps({"users": []}, ensure_ascii=False, indent=2))
     if not CHAT_FILE.exists():
-        CHAT_FILE.write_text(json.dumps({"messages": []}, indent=2))
+        CHAT_FILE.write_text(json.dumps({"messages": []}, ensure_ascii=False, indent=2))
 
-def load(path): return json.loads(path.read_text(encoding="utf-8"))
-def save(path, data): path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+# остальной код без изменений...
+
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 def hash_password(password, salt):
     return hashlib.sha256((salt + password).encode()).hexdigest()
 
-@app.route("/register", methods=["POST"])
-def register():
-    data = request.json
-    accounts = load(ACCOUNTS_FILE)
-    if any(u["username"] == data["username"] for u in accounts["users"]):
-        return jsonify({"status": "error", "message": "Пользователь уже существует."})
-    salt = secrets.token_hex(8)
-    password_hash = hash_password(data["password"], salt)
-    accounts["users"].append({
-        "username": data["username"],
-        "salt": salt,
-        "password_hash": password_hash
-    })
-    save(ACCOUNTS_FILE, accounts)
-    return jsonify({"status": "ok"})
+def register_user(username, password):
+    accounts = load_json(ACCOUNTS_FILE)
+    if any(u['username'] == username for u in accounts['users']):
+        return {"status": "error", "message": "Пользователь уже существует."}
+    salt = secrets.token_hex(16)
+    password_hash = hash_password(password, salt)
+    accounts['users'].append({"username": username, "salt": salt, "password_hash": password_hash})
+    save_json(ACCOUNTS_FILE, accounts)
+    return {"status": "ok"}
 
-@app.route("/login", methods=["POST"])
-def login():
-    data = request.json
-    accounts = load(ACCOUNTS_FILE)
-    for u in accounts["users"]:
-        if u["username"] == data["username"]:
-            if hash_password(data["password"], u["salt"]) == u["password_hash"]:
-                return jsonify({"status": "ok"})
-            return jsonify({"status": "error", "message": "Неверный пароль."})
-    return jsonify({"status": "error", "message": "Пользователь не найден."})
+def login_user(username, password):
+    accounts = load_json(ACCOUNTS_FILE)
+    for user in accounts['users']:
+        if user['username'] == username:
+            if hash_password(password, user['salt']) == user['password_hash']:
+                return {"status": "ok"}
+            else:
+                return {"status": "error", "message": "Неверный пароль."}
+    return {"status": "error", "message": "Пользователь не найден."}
 
-@app.route("/send", methods=["POST"])
-def send():
-    data = request.json
-    chat = load(CHAT_FILE)
+def add_message(username, text):
+    chat = load_json(CHAT_FILE)
     timestamp = datetime.datetime.now().isoformat(sep=" ", timespec="seconds")
-    chat["messages"].append({
-        "username": data["username"],
-        "timestamp": timestamp,
-        "text": data["text"]
-    })
-    save(CHAT_FILE, chat)
-    return jsonify({"status": "ok"})
+    chat['messages'].append({"username": username, "timestamp": timestamp, "text": text})
+    save_json(CHAT_FILE, chat)
 
-@app.route("/messages", methods=["GET"])
-def get_messages():
-    chat = load(CHAT_FILE)
-    return jsonify({"status": "ok", "messages": chat["messages"]})
+def handle_client(conn, addr):
+    print(f"[+] Подключен клиент: {addr}")
+    with conn:
+        while True:
+            try:
+                data = conn.recv(4096).decode("utf-8")
+                if not data:
+                    break
+                request = json.loads(data)
+                response = {}
+
+                if request["action"] == "register":
+                    response = register_user(request["username"], request["password"])
+                elif request["action"] == "login":
+                    response = login_user(request["username"], request["password"])
+                elif request["action"] == "send_message":
+                    add_message(request["username"], request["text"])
+                    response = {"status": "ok"}
+                elif request["action"] == "get_messages":
+                    chat = load_json(CHAT_FILE)
+                    response = {"status": "ok", "messages": chat['messages']}
+                else:
+                    response = {"status": "error", "message": "Неизвестное действие."}
+
+                conn.sendall(json.dumps(response).encode("utf-8"))
+            except Exception as e:
+                print(f"[!] Ошибка с клиентом {addr}: {e}")
+                break
+    print(f"[-] Отключен клиент: {addr}")
+
+def start_server():
+    ensure_data_files()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((HOST, PORT))
+        s.listen()
+        print(f"[SERVER] Сервер запущен на {HOST}:{PORT}")
+
+        while True:
+            conn, addr = s.accept()
+            thread = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+            thread.start()
 
 if __name__ == "__main__":
-    init_storage()
-    app.run(host="0.0.0.0", port=10000)
+    start_server()
